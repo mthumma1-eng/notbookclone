@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.gradio/
+.DS_Store
+*.log
+data/*
+!data/.gitkeep
+storage/*
+!storage/.gitkeep
+chroma_db/*
+!chroma_db/.gitkeep
