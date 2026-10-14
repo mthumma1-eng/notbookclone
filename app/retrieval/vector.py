@@ -2,46 +2,38 @@
 import os
 import numpy as np
 import chromadb
-from huggingface_hub import InferenceClient
+from fastembed import TextEmbedding
 from app.config import CHROMA_DIR
 
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
-    "BAAI/bge-small-en-v1.5"
+    "BAAI/bge-small-en-v1.5",
 )
-HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 _client = chromadb.PersistentClient(path=CHROMA_DIR)
-_hf_client = None
+_embedding_model = None
 
 
-def hf_client():
-    global _hf_client
-    if not HF_TOKEN:
-        raise RuntimeError(
-            "HF_TOKEN is missing. Add a Hugging Face token "
-            "to your environment variables."
+def get_embedding_model():
+    global _embedding_model
+
+    if _embedding_model is None:
+        _embedding_model = TextEmbedding(
+            model_name=EMBEDDING_MODEL,
+            threads=1,
         )
-    if _hf_client is None:
-        _hf_client = InferenceClient(token=HF_TOKEN)
-    return _hf_client
+
+    return _embedding_model
 
 
 def embed_texts(texts):
-    result = hf_client().feature_extraction(
-        texts,
-        model=EMBEDDING_MODEL
-    )
-    vectors = np.asarray(result, dtype=np.float32)
+    if not texts:
+        return []
 
-    # Ensure one vector per input text.
-    if vectors.ndim == 1:
-        vectors = vectors.reshape(1, -1)
+    model = get_embedding_model()
+    vectors = list(model.embed(texts, batch_size=8))
 
-    # Normalize vectors for cosine-style similarity.
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    vectors = vectors / np.maximum(norms, 1e-12)
-    return vectors.tolist()
+    return [vector.tolist() for vector in vectors]
 
 
 def collection(nid):
@@ -55,88 +47,107 @@ def add_chunks(nid, chunks, metadatas):
         return
 
     c = collection(nid)
-    ids = [
-        f"{nid}_{i}_{abs(hash(ch))}"
-        for i, ch in enumerate(chunks)
-    ]
-    embeddings = embed_texts(chunks)
 
-    c.add(
-        ids=ids,
-        documents=chunks,
-        metadatas=metadatas,
-        embeddings=embeddings
-    )
+    # Process small batches to limit memory usage.
+    for start in range(0, len(chunks), 8):
+        batch_chunks = chunks[start:start + 8]
+        batch_metadata = metadatas[start:start + 8]
+
+        ids = [
+            f"{nid}_{i}_{abs(hash(chunk))}"
+            for i, chunk in enumerate(
+                batch_chunks, start=start
+            )
+        ]
+
+        embeddings = embed_texts(batch_chunks)
+
+        c.upsert(
+            ids=ids,
+            documents=batch_chunks,
+            metadatas=batch_metadata,
+            embeddings=embeddings,
+        )
 
 
 def query_basic(nid, q, k=4):
     c = collection(nid)
+
     if c.count() == 0:
         return []
 
-    emb = embed_texts([q])
-    r = c.query(
-        query_embeddings=emb,
+    embeddings = embed_texts([q])
+
+    result = c.query(
+        query_embeddings=embeddings,
         n_results=min(k, c.count()),
-        include=["documents", "metadatas", "distances"]
+        include=["documents", "metadatas", "distances"],
     )
 
     return [
-        {"text": d, "metadata": m, "distance": dist}
-        for d, m, dist in zip(
-            r["documents"][0],
-            r["metadatas"][0],
-            r["distances"][0]
+        {"text": doc, "metadata": meta, "distance": distance}
+        for doc, meta, distance in zip(
+            result["documents"][0],
+            result["metadatas"][0],
+            result["distances"][0],
         )
     ]
 
 
 def query_mmr(nid, q, k=4, fetch=12, lambda_mult=0.65):
     c = collection(nid)
+
     if c.count() == 0:
         return []
 
-    emb = embed_texts([q])
-    r = c.query(
-        query_embeddings=emb,
+    embeddings = embed_texts([q])
+
+    result = c.query(
+        query_embeddings=embeddings,
         n_results=min(fetch, c.count()),
-        include=["documents", "metadatas", "embeddings"]
+        include=["documents", "metadatas", "embeddings"],
     )
 
-    docs = r["documents"][0]
-    metas = r["metadatas"][0]
-    vectors = np.asarray(r["embeddings"][0], dtype=np.float32)
+    docs = result["documents"][0]
+    metas = result["metadatas"][0]
 
     if not docs:
         return []
 
-    qv = np.asarray(emb[0], dtype=np.float32)
-    similarities = vectors @ qv
+    vectors = np.asarray(
+        result["embeddings"][0], dtype=np.float32
+    )
+    query_vector = np.asarray(embeddings[0], dtype=np.float32)
 
+    similarities = vectors @ query_vector
     selected = []
     remaining = list(range(len(docs)))
 
     while remaining and len(selected) < min(k, len(docs)):
         if not selected:
-            idx = max(remaining, key=lambda i: similarities[i])
+            chosen = max(
+                remaining, key=lambda i: similarities[i]
+            )
         else:
-            idx = max(
+            chosen = max(
                 remaining,
-                key=lambda i: lambda_mult * similarities[i]
-                - (1 - lambda_mult) * max(
-                    float(vectors[i] @ vectors[j])
-                    for j in selected
-                )
+                key=lambda i: (
+                    lambda_mult * similarities[i]
+                    - (1 - lambda_mult) * max(
+                        float(vectors[i] @ vectors[j])
+                        for j in selected
+                    )
+                ),
             )
 
-        selected.append(idx)
-        remaining.remove(idx)
+        selected.append(chosen)
+        remaining.remove(chosen)
 
     return [
         {
             "text": docs[i],
             "metadata": metas[i],
-            "distance": float(1 - similarities[i])
+            "distance": float(1 - similarities[i]),
         }
         for i in selected
     ]
